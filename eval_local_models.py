@@ -7,6 +7,7 @@ Usage:
 
 import random
 import os
+import re
 from typing import Literal
 
 import pandas as pd
@@ -20,15 +21,37 @@ class JudgeResponse(BaseModel):
 
 
 SYSTEM_PROMPT = """\
-Du er en expert i danska sprog. Du får to setninger og skal afgøres hvilken der er best sprogligt.."""
+Du er en expert i danska sprog. Du får to setninger og skal afgøres hvilken der er best sprogligt.
+Du skal svare med et JSON object som indeholder præcis 2 felter:
+- "reasoning": en kort forklaring a dit valg (1-2 sætninger)
+- "choice": enten "A" eller "B"
+
+Eksempel på svar:
+{
+    "reasoning": "Sætning A er mere naturlig og grammatisk korrekt.",
+    "choice": "A"
+}
+
+Svar kun med JSON-objektet. Inkludér ikke andet tekst eller markdown-formattering."""
+
+def extract_json(content: str) -> str:
+    # strip markdown code fences
+    content = re.sub(r"```json|```", "", content)
+    # extract the first {...} block, in case there's trailing text like ***
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object found in response: {content!r}")
+    return match.group()
 
 
 def judge(model: str, sentence_a: str, sentence_b: str, api_base: str | None,
           api_key: str | None) -> JudgeResponse:
+    use_structured_output = not model.startswith("together_ai")  # only use for native providers
 
     response = completion(
         api_base=api_base,
         api_key=api_key,
+        drop_params=True,
         model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -38,11 +61,16 @@ def judge(model: str, sentence_a: str, sentence_b: str, api_base: str | None,
             },
         ],
         # temperature=0.0, # Set to 0 for deterministic output, but may cause issues with some models. Adjust as needed.
-        response_format=JudgeResponse
+        response_format=JudgeResponse if use_structured_output else {"type": "json_object"},
     )
     content: str = response.choices[0].message.content  # type: ignore
+    content = extract_json(content)
+    try:
+        return JudgeResponse.model_validate_json(content)
+    except Exception as e:
 
-    return JudgeResponse.model_validate_json(content)
+        return JudgeResponse.model_validate_json(content)
+
 
 def evaluate(df: pd.DataFrame, model: str, api_base: str | None, api_key: str | None,
              seed: int = 42,) -> pd.DataFrame:
@@ -83,21 +111,23 @@ if __name__ == "__main__":
     custom_base_url = os.getenv("CUSTOM_BASE_URL")
     custom_api_key = os.getenv("CUSTOM_API_KEY")
 
+    OLLAMA_BASE_URL = "http://localhost:11434"
+
     models: dict[str, str | None] = {
-        # OpenAI
-        "openai/gpt-4o": None,
-        "openai/gpt-4o-mini": None,
-        "openai/o3-mini": None,
-        # Anthropic
-        "anthropic/claude-opus-4-6": None,
-        "anthropic/claude-sonnet-4-6": None,
-        "anthropic/claude-haiku-4-5": None,
-        # Google
-        "google/gemini-2.5-pro": None,
-        "google/gemini-2.5-flash": None,
-        "google/gemini-2.0-flash-lite": None,
-        # Custom
-        "openai/qwen-235b": custom_base_url,
+        # Large / high quality
+        "ollama/llama3.3:70b": OLLAMA_BASE_URL,
+        "ollama/qwen2.5:72b": OLLAMA_BASE_URL,
+        "ollama/mistral-large": OLLAMA_BASE_URL,
+
+        # Medium
+        "ollama/llama3.1:8b": OLLAMA_BASE_URL,
+        "ollama/qwen2.5:14b": OLLAMA_BASE_URL,
+        "ollama/gemma3:12b": OLLAMA_BASE_URL,
+
+        # Small / fast
+        "ollama/llama3.2:3b": OLLAMA_BASE_URL,
+        "ollama/qwen2.5:7b": OLLAMA_BASE_URL,
+        "ollama/gemma3:4b": OLLAMA_BASE_URL,
     }
 
     for model_name, api_base in models.items():
@@ -109,9 +139,7 @@ if __name__ == "__main__":
                 model=model_name,
                 api_base=api_base,
                 api_key=api_key,
-            )  # we could make this into a loop to evaluate multiple models
-            # for evaluting local models we can either use ollama or vllm to serve the model and then call it via the API,
-            # e.g. using ollama - read more here https://docs.litellm.ai/
+            )
 
         except Exception as e:
             print(f"Failed to evaluate {model_name}: {e}")
